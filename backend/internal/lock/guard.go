@@ -15,14 +15,23 @@ import (
 // 同进程内的请求会在持有 Redis 锁的情况下排队等本地锁，白白占用分布式锁 TTL。
 type SlotGuard struct {
 	local     *CarSlotLocalLock
-	dist      *RedisLock
+	dist      DistLock
 	txBudget  time.Duration
 	shardHint int
 }
 
+// DistLock 是 L2 跨副本互斥锁的抽象。
+//
+// 抽成接口是为了让 SlotGuard 的错误路径（ErrNotAcquired → 释放 L1）可被
+// 单元测试覆盖：测试可注入一个永远失败的桩实现，无需真实 Redis。
+type DistLock interface {
+	Enabled() bool
+	Acquire(ctx context.Context, roomID int64) (func(), error)
+}
+
 // NewSlotGuard 构造抢位守卫。txBudget 是单次临界区的时间预算，超出仅告警不中断
 // （中断会让已提交的事务与告警不一致，反而更难排查）。
-func NewSlotGuard(local *CarSlotLocalLock, dist *RedisLock, txBudget time.Duration) *SlotGuard {
+func NewSlotGuard(local *CarSlotLocalLock, dist DistLock, txBudget time.Duration) *SlotGuard {
 	return &SlotGuard{local: local, dist: dist, txBudget: txBudget, shardHint: local.Shards()}
 }
 
@@ -37,8 +46,12 @@ func (g *SlotGuard) DistEnabled() bool { return g.dist.Enabled() }
 func (g *SlotGuard) Do(ctx context.Context, roomID int64, fn func(context.Context) error) error {
 	releaseLocal := g.local.Acquire(roomID)
 
+	// L1 必须在 L2 失败时显式释放。sync.Mutex 没有 TTL，一旦漏放就永久
+	// 持有，本进程内该房间的所有后续席位操作（confirm/leave/lock/cancel/join）
+	// 都会阻塞在 mus[i].Lock() 直到进程重启。
 	releaseDist, err := g.dist.Acquire(ctx, roomID)
 	if err != nil {
+		releaseLocal()
 		if errors.Is(err, ErrNotAcquired) {
 			return apperr.ErrSlotLockBusy.WithCause(err)
 		}
