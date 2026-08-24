@@ -402,6 +402,88 @@ def test_join_idempotent():
     expect_eq(len(ids), len(set(ids)), "同一用户不应出现多条在座成员记录")
 
 
+@test("★ 弱网重放幂等：最后一席触发锁车后重放仍应成功")
+def test_last_seat_replay_idempotent():
+    """
+    回归测试：移动端弱网下抢到最后一个位时，首个响应丢失后客户端重放
+    完全相同的请求，必须收到幂等成功而非 409 ROOM_NOT_RECRUITING。
+
+    复现路径：
+      1. 房间被填到 capacity-1（只剩最后一个位）
+      2. 用户 A 上车 → 占住最后一席 → 满员触发自动锁车 → 房间变为 LOCKED
+      3. 模拟首个响应丢失：客户端用完全相同的参数重放 join
+      4. 重放必须返回成功（idempotent=true），而非 ROOM_NOT_RECRUITING
+
+    Bug 根因：原代码先检查 room.Status != RECRUITING 再做幂等查询，
+    当重放时房间已是 LOCKED，状态检查直接返回 409，永远到不了幂等分支。
+    修复：幂等检查必须先于房间状态检查。
+    """
+    owner = new_user()
+    capacity = 4
+    card = make_room(owner, any_seats=capacity, min_viable=2)
+    room_id = card["room"]["id"]
+
+    # 填到只剩 1 个位。
+    fillers = [new_user() for _ in range(capacity - 2)]
+    for f in fillers:
+        f.ok("POST", "/api/rooms/%d/join" % room_id, {"seat_gender": "ANY"})
+
+    snap = owner.ok("GET", "/api/rooms/%d" % room_id)["snapshot"]
+    expect_eq(snap["remaining"], 1, "预热后应恰好剩 1 个席位")
+    expect_eq(snap["status"], "RECRUITING", "未满员应仍在招募中")
+
+    # 抢最后一个位——这次上车间会触发满员自动锁车。
+    last_joiner = new_user()
+    status1, code1, data1 = last_joiner.call(
+        "POST", "/api/rooms/%d/join" % room_id, {"seat_gender": "ANY"}
+    )
+    expect_eq(code1, "", "首次抢最后一位应成功，实际 %s" % code1)
+
+    # 验证房间确实已满员并自动锁车。
+    snap = owner.ok("GET", "/api/rooms/%d" % room_id)["snapshot"]
+    expect_eq(snap["occupied"], capacity, "应已满员")
+    expect_eq(snap["status"], "LOCKED", "满员应自动锁车")
+    expect_eq(snap["remaining"], 0, "剩余席位应为 0")
+
+    # 确认该用户确实在车上。
+    members = owner.ok("GET", "/api/rooms/%d" % room_id)["members"]
+    member_ids = [m["user"]["id"] for m in members]
+    expect(last_joiner.user["id"] in member_ids, "抢到最后一位的用户应在成员列表中")
+
+    # ★ 核心：模拟弱网首个响应丢失，客户端重放完全相同的请求。
+    status2, code2, data2 = last_joiner.call(
+        "POST", "/api/rooms/%d/join" % room_id, {"seat_gender": "ANY"}
+    )
+    expect_eq(
+        code2, "",
+        "重放最后一席的上车请求应幂等成功，实际 %d %s（房间已是 LOCKED，"
+        "不应返回 ROOM_NOT_RECRUITING）" % (status2, code2),
+    )
+    expect_eq(status2, 200, "幂等重放应返回 200")
+    expect(
+        data2.get("idempotent") is True,
+        "幂等重放应标记 idempotent=true，实际 %r" % data2.get("idempotent"),
+    )
+
+    # 重放不应改变席位账目。
+    snap = owner.ok("GET", "/api/rooms/%d" % room_id)["snapshot"]
+    expect_eq(snap["occupied"], capacity, "重放后席位不应变化")
+    expect_eq(snap["status"], "LOCKED", "重放后房间状态不应变化")
+
+    a = audit(owner, room_id)
+    expect_eq(a["drift"], 0, "重放后的账目漂移")
+
+    # 对照组：普通未满房间的重复请求仍应成功（确保修复没有破坏正常幂等）。
+    owner2 = new_user()
+    card2 = make_room(owner2, any_seats=6, min_viable=2)
+    room_id2 = card2["room"]["id"]
+    u2 = new_user()
+    u2.ok("POST", "/api/rooms/%d/join" % room_id2, {"seat_gender": "ANY"})
+    _, code3, data3 = u2.call("POST", "/api/rooms/%d/join" % room_id2, {"seat_gender": "ANY"})
+    expect_eq(code3, "", "未满房间重复上车应成功")
+    expect(data3.get("idempotent") is True, "未满房间重复上车应标记幂等")
+
+
 @test("满员自动锁车，有人退车后自动回到招募中")
 def test_lock_and_reopen():
     owner = new_user()

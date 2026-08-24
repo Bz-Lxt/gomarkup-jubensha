@@ -77,21 +77,27 @@ func (s *SlotService) Join(ctx context.Context, roomID, userID int64, seat model
 
 	var out *JoinResult
 	err := s.withSlotLock(ctx, roomID, func(ctx context.Context, q repository.Querier, room *model.Room) ([]pendingEvent, error) {
-		// ---- 房间状态校验（在 FOR UPDATE 保护下）----
-		if room.Status != model.RoomRecruiting {
-			return nil, apperr.ErrRoomNotRecruiting.
-				WithMessage("这辆车当前是「"+room.Status.Label()+"」，上不了车").
-				WithDetail("status", string(room.Status))
-		}
-
-		// ---- 幂等校验 ----
-		// 用户连点 50 次也只能占一个位（NFR-1 A-3）。这里先查一次是为了给出
-		// 友好结果；真正的幂等保证在下面的唯一索引冲突分支。
+		// ---- 幂等校验（必须在房间状态校验之前）----
+		// 用户连点 50 次也只能占一个位（NFR-1 A-3）。
+		//
+		// 顺序至关紧要：弱网下首个响应丢失后客户端重放时，房间可能已经
+		// 因满员而自动锁车（LOCKED）。如果先检查房间状态，重放会收到
+		// ROOM_NOT_RECRUITING 而非幂等成功，造成「第一次成功、第二次失败」
+		// 的分叉——这正是移动端弱网复现的幂等分叉 bug。
+		// 只要该用户仍占着席位（PENDING/JOINED/CHECKED_IN），就应返回与
+		// 首次相同的结果，不受房间状态流转的影响。
 		if existing, err := s.d.Members.GetActive(ctx, q, roomID, userID); err == nil {
 			out = &JoinResult{Room: room, Snapshot: room.Snapshot(), Member: existing, Idempotent: true}
 			return nil, nil
 		} else if !repository.IsNoRows(err) {
 			return nil, err
+		}
+
+		// ---- 房间状态校验（在 FOR UPDATE 保护下）----
+		if room.Status != model.RoomRecruiting {
+			return nil, apperr.ErrRoomNotRecruiting.
+				WithMessage("这辆车当前是「"+room.Status.Label()+"」，上不了车").
+				WithDetail("status", string(room.Status))
 		}
 
 		// ---- 时间与容量校验（都在 FOR UPDATE 保护下）----
@@ -130,9 +136,22 @@ func (s *SlotService) Join(ctx context.Context, roomID, userID int64, seat model
 			if repository.IsUniqueViolation(err) {
 				// 同一用户的并发请求撞上了部分唯一索引 uq_members_active。
 				// 这正是幂等屏障生效的表现，不是错误。
+				//
+				// 返回幂等成功而非 ErrAlreadyOnBoard：调用方依赖请求重放兜弱网，
+				// 重放应当与首次成功得到完全一致的结果。无论是 GetActive 先行
+				// 命中还是唯一索引兜底命中，两条路径的结果必须同构。
 				logger.C(ctx).Info("幂等屏障命中：同一用户并发上车",
 					"room_id", roomID, "user_id", userID)
-				return nil, apperr.ErrAlreadyOnBoard.WithCause(err)
+				existing, gErr := s.d.Members.GetActive(ctx, q, roomID, userID)
+				if gErr != nil {
+					// 理论上不会走到：唯一索引冲突说明行存在，GetActive 必然能查到。
+					// 真走到这里说明出现了严重的数据不一致，返回内部错误以便排查。
+					return nil, apperr.ErrInternal.
+						WithMessage("幂等屏障命中但无法读取已存在的成员记录").
+						WithCause(gErr)
+				}
+				out = &JoinResult{Room: room, Snapshot: room.Snapshot(), Member: existing, Idempotent: true}
+				return nil, nil
 			}
 			return nil, err
 		}
