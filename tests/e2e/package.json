@@ -1,0 +1,12 @@
+{
+  "name": "jubensha-carpool-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "description": "野生拼车墙端到端测试（Playwright）",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}
