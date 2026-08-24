@@ -105,7 +105,13 @@ export function useRoomChat({ roomID, onSlot, onStatus, onError }: Options): Cha
           const bf = env.data as Backfill
           setTruncated(bf.truncated)
           merge(bf.messages)
-          if (bf.latest_seq > lastSeqRef.current) lastSeqRef.current = bf.latest_seq
+          // 截断时实际返回的消息可能不覆盖到 latest_seq（中间有断层）。
+          // 若仍把游标推进到 latest_seq，断层区间的消息将永远无法通过
+          // 正常补齐取回——后续 chat.pull 带的 last_seen_seq 已越过它们。
+          // 游标只推进到实际收到的最大 seq（to_seq），让下一次补齐从断层
+          // 边缘继续，从而分批取回全部消息。
+          const target = bf.truncated ? bf.to_seq : bf.latest_seq
+          if (target > lastSeqRef.current) lastSeqRef.current = target
           break
         }
         case 'room.slot':
@@ -141,7 +147,10 @@ export function useRoomChat({ roomID, onSlot, onStatus, onError }: Options): Cha
         if (!alive) return
         setTruncated(bf.truncated)
         merge(bf.messages)
-        if (bf.latest_seq > lastSeqRef.current) lastSeqRef.current = bf.latest_seq
+        // 截断时游标只推进到实际返回的最大序号（to_seq），而非 latest_seq。
+        // 否则断层区间的消息会被跳过，刷新/重连都拿不回来。
+        const target = bf.truncated ? bf.to_seq : bf.latest_seq
+        if (target > lastSeqRef.current) lastSeqRef.current = target
       })
       .catch(() => {
         // 首屏拉取失败不致命：WS 连上后的补齐会把消息带回来。

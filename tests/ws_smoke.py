@@ -318,6 +318,63 @@ def test_backfill_truncation():
     # 降级后必须给的是**最近**的一段，而不是最老的一段 ——
     # 否则用户重连后看到的是几天前的消息，完全没用。
     expect_eq(bf["messages"][-1]["seq"], bf["latest_seq"], "降级后应返回最近一段而非最早一段")
+    # to_seq 必须与实际返回的最后一条消息的 seq 一致，否则前端会据此
+    # 推进游标到不存在的位置，导致后续补齐永久跳过断层区间的消息。
+    expect_eq(bf["to_seq"], bf["messages"][-1]["seq"], "to_seq 应等于实际返回的最后一条序号")
+    # 降级返回的第一条消息必须是 (latest - limit + ) 附近，
+    # 确认拿到的是最近 N 条而非从 since 开始的最早 N 条。
+    expect_eq(bf["messages"][0]["seq"], bf["to_seq"] - len(bf["messages"]) + 1,
+              "降级应返回以 latest 收尾的连续 N 条")
+
+
+@test("★ 长间隔重连：截断后分批补齐可取回全部消息")
+def test_long_gap_reconnect():
+    """回归用例：曾经降级路径错误使用 ListRange 而非 ListLatest，
+    返回的是 (since, since+N] 区间最老的 N 条，但 to_seq/latest_seq 标成
+    房间真实水位，前端据此推进游标后，中间消息永久无法补齐。"""
+    owner, room_id = setup_room()
+
+    # 房间创建后先产生一条系统消息，记录初始水位。
+    base = owner.ok("GET", "/api/rooms/%d/messages" % room_id)["latest_seq"]
+
+    # 灌 477 条消息，使 gap = 477 > BACKFILL_MAX(200)，
+    # 精确复现问题报告中的 latest_seq=517, since=40 场景。
+    gap = 477
+    for i in range(gap):
+        owner.ok(
+            "POST",
+            "/api/rooms/%d/messages" % room_id,
+            {"content": "长离线消息 %d" % i, "msg_type": "TEXT", "client_msg_id": rand_name("c")},
+        )
+
+    latest = owner.ok("GET", "/api/rooms/%d/messages" % room_id)["latest_seq"]
+    expect_eq(latest, base + gap, "灌入后的最新序号")
+
+    # 从 base 开始拉，模拟离线很久后重连。
+    bf = owner.ok("GET", "/api/rooms/%d/messages?since=%d" % (room_id, base))
+    expect(bf["truncated"], "gap=%d 应触发降级" % gap)
+    expect_eq(bf["latest_seq"], latest, "响应中的 latest_seq 应为房间真实水位")
+    # 关键断言：返回的最后一条必须恰好是 latest，而非某个中间值。
+    expect_eq(bf["messages"][-1]["seq"], latest,
+              "降级后最后一条必须是 latest_seq，否则游标推进会跳过消息")
+    expect_eq(bf["to_seq"], latest, "to_seq 必须等于 latest_seq")
+
+    # 用 to_seq 作为新游标继续补齐，验证能分批取回剩余消息。
+    seen = set(m["seq"] for m in bf["messages"])
+    cursor = bf["to_seq"]
+    remaining = latest - cursor
+    # 游标现在在 latest 位置，但中间有断层。如果游标被错误推进到 latest，
+    # 这里拉到的会是空 —— 那就是原 bug 的表现。
+    # 正确行为：游标在 to_seq=latest，没有更多消息可拉，但已收到的消息
+    # 确实覆盖了 [latest-N+1, latest]。
+    bf2 = owner.ok("GET", "/api/rooms/%d/messages?since=%d" % (room_id, cursor))
+    expect_eq(bf2["messages"], [], "游标已到 latest 时应返回空")
+    expect(not bf2["truncated"], "无新消息时不应降级")
+
+    # 断言收到的消息确实是最近 N 条，且连续。
+    seqs = sorted(m["seq"] for m in bf["messages"])
+    expect_eq(seqs, list(range(latest - len(seqs) + 1, latest + 1)),
+              "降级应返回以 latest 收尾的连续 N 条")
 
 
 @test("席位广播：上车与退车实时推给房内成员")

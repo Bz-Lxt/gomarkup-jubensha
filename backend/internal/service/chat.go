@@ -12,16 +12,26 @@ import (
 )
 
 // ChatService 处理房内消息的落库、广播与离线补齐。
-type ChatService struct{ d *Deps }
+type ChatService struct {
+	d        *Deps
+	messages MessageStore
+	members  MemberStore
+}
 
-func NewChatService(d *Deps) *ChatService { return &ChatService{d: d} }
+func NewChatService(d *Deps) *ChatService {
+	return &ChatService{
+		d:        d,
+		messages: d.Messages,
+		members:  d.Members,
+	}
+}
 
 // EnsureMember 是聊天室的准入判据：只有占着席位的人才能读写房内消息。
 //
 // WS 握手和每一条 HTTP 聊天请求都要过这一关。仅靠「前端不显示入口」是不够的，
 // 那不是权限控制（NFR-4 越权防护）。
 func (s *ChatService) EnsureMember(ctx context.Context, roomID, userID int64) error {
-	ok, err := s.d.Members.IsActiveMember(ctx, s.d.Pool, roomID, userID)
+	ok, err := s.members.IsActiveMember(ctx, s.d.Pool, roomID, userID)
 	if err != nil {
 		return err
 	}
@@ -79,7 +89,7 @@ func (s *ChatService) Send(ctx context.Context, roomID, userID int64, in model.C
 	err := repository.InTx(ctx, s.d.Pool, func(q repository.Querier) error {
 		// 重发幂等：网络抖动导致客户端重试时，同一 client_msg_id 只落一条。
 		if clientMsgID != "" {
-			if existing, err := s.d.Messages.GetByClientMsgID(ctx, q, roomID, userID, clientMsgID); err == nil {
+			if existing, err := s.messages.GetByClientMsgID(ctx, q, roomID, userID, clientMsgID); err == nil {
 				out = existing
 				return nil
 			} else if !repository.IsNoRows(err) {
@@ -100,10 +110,10 @@ func (s *ChatService) Send(ctx context.Context, roomID, userID int64, in model.C
 			TagCode:     tagCode,
 			ClientMsgID: clientMsgID,
 		}
-		if err := s.d.Messages.Insert(ctx, q, msg); err != nil {
+		if err := s.messages.Insert(ctx, q, msg); err != nil {
 			if repository.IsUniqueViolation(err) {
 				// 并发重发撞上 uq_msg_client，回读既有那条即可。
-				if existing, gErr := s.d.Messages.GetByClientMsgID(ctx, q, roomID, userID, clientMsgID); gErr == nil {
+				if existing, gErr := s.messages.GetByClientMsgID(ctx, q, roomID, userID, clientMsgID); gErr == nil {
 					out = existing
 					return nil
 				}
@@ -135,6 +145,13 @@ func (s *ChatService) Send(ctx context.Context, roomID, userID int64, in model.C
 //
 // 阈值存在的理由：用户离线三天后回来，房间里可能积了几千条消息。一次性推给
 // 前端既拖慢首屏又没人会往上翻那么远，不如明确告诉他「中间省略了」。
+//
+// 降级路径必须用 ListLatest 而非 ListRange：
+// ListRange(fromSeq, latest, limit) 的 SQL 是 WHERE seq > fromSeq ORDER BY seq ASC LIMIT n，
+// 返回的是 (fromSeq, fromSeq+n] ——即区间内**最老**的 n 条。用户落后 477 条时拿到的
+// 是 seq 41..240，而 to_seq/latest_seq 却标成 517，前端据此把游标推进到 517，
+// 导致 241..517 永远无法通过正常补齐取回。ListLatest 取最近 n 条并反转为升序，
+// 保证返回区间以 latest 收尾，与 to_seq/latest_seq 一致。
 func (s *ChatService) Backfill(ctx context.Context, roomID, userID, lastSeenSeq int64) (*model.Backfill, error) {
 	if err := s.EnsureMember(ctx, roomID, userID); err != nil {
 		return nil, err
@@ -143,7 +160,7 @@ func (s *ChatService) Backfill(ctx context.Context, roomID, userID, lastSeenSeq 
 		lastSeenSeq = 0
 	}
 
-	latest, err := s.d.Messages.LatestSeq(ctx, s.d.Pool, roomID)
+	latest, err := s.messages.LatestSeq(ctx, s.d.Pool, roomID)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +172,7 @@ func (s *ChatService) Backfill(ctx context.Context, roomID, userID, lastSeenSeq 
 	maxN := int64(s.d.Cfg.BackfillMax)
 
 	if gap <= maxN {
-		msgs, err := s.d.Messages.ListRange(ctx, s.d.Pool, roomID, lastSeenSeq, latest, s.d.Cfg.BackfillMax)
+		msgs, err := s.messages.ListRange(ctx, s.d.Pool, roomID, lastSeenSeq, latest, s.d.Cfg.BackfillMax)
 		if err != nil {
 			return nil, err
 		}
@@ -164,20 +181,23 @@ func (s *ChatService) Backfill(ctx context.Context, roomID, userID, lastSeenSeq 
 
 	logger.C(ctx).Info("离线消息过多，触发全量降级",
 		"room_id", roomID, "user_id", userID, "gap", gap, "cap", maxN)
-	msgs, err := s.d.Messages.ListRange(ctx, s.d.Pool, roomID, lastSeenSeq, latest, s.d.Cfg.BackfillMax)
+	// 降级：取最近 BackfillMax 条，而非 (lastSeenSeq, lastSeenSeq+BackfillMax]。
+	// from_seq/to_seq 如实反映实际返回的消息边界，让前端知道断层在哪里。
+	msgs, err := s.messages.ListLatest(ctx, s.d.Pool, roomID, s.d.Cfg.BackfillMax)
 	if err != nil {
 		return nil, err
 	}
-	from := lastSeenSeq
+	from, to := lastSeenSeq, latest
 	if len(msgs) > 0 {
 		from = msgs[0].Seq - 1
+		to = msgs[len(msgs)-1].Seq
 	}
-	return model.NewBackfill(msgs, from, latest, latest, gap, true), nil
+	return model.NewBackfill(msgs, from, to, latest, gap, true), nil
 }
 
 // Cursor 返回用户在该房间的已读水位。
 func (s *ChatService) Cursor(ctx context.Context, roomID, userID int64) (int64, error) {
-	return s.d.Messages.GetCursor(ctx, s.d.Pool, roomID, userID)
+	return s.messages.GetCursor(ctx, s.d.Pool, roomID, userID)
 }
 
 // Ack 推进已读水位。游标只前进不后退（由 SQL 的 GREATEST 保证）。
@@ -185,15 +205,15 @@ func (s *ChatService) Ack(ctx context.Context, roomID, userID, seq int64) error 
 	if seq < 0 {
 		return apperr.ErrWSPayloadInvalid.WithDetail("field", "seq")
 	}
-	return s.d.Messages.UpsertCursor(ctx, s.d.Pool, roomID, userID, seq)
+	return s.messages.UpsertCursor(ctx, s.d.Pool, roomID, userID, seq)
 }
 
 // Unread 返回该用户所有在车房间的未读数。
 func (s *ChatService) Unread(ctx context.Context, userID int64) ([]repository.UnreadCount, error) {
-	return s.d.Messages.UnreadByUser(ctx, s.d.Pool, userID)
+	return s.messages.UnreadByUser(ctx, s.d.Pool, userID)
 }
 
 // LatestSeq 返回房间的消息水位，供 WS 握手首帧使用。
 func (s *ChatService) LatestSeq(ctx context.Context, roomID int64) (int64, error) {
-	return s.d.Messages.LatestSeq(ctx, s.d.Pool, roomID)
+	return s.messages.LatestSeq(ctx, s.d.Pool, roomID)
 }

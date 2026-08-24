@@ -30,6 +30,29 @@ type Publisher interface {
 	OnlineUserIDs(ctx context.Context, roomID int64) []int64
 }
 
+// MessageStore 抽象 ChatService 所需的消息仓储操作。
+//
+// *repository.MessageRepo 天然满足此接口（结构化类型），生产代码不受影响；
+// 单元测试可注入 mock 实现来验证补齐逻辑，无需数据库。
+type MessageStore interface {
+	LatestSeq(ctx context.Context, q repository.Querier, roomID int64) (int64, error)
+	ListRange(ctx context.Context, q repository.Querier, roomID, fromSeq, toSeq int64, limit int) ([]model.Message, error)
+	ListLatest(ctx context.Context, q repository.Querier, roomID int64, limit int) ([]model.Message, error)
+	GetCursor(ctx context.Context, q repository.Querier, roomID, userID int64) (int64, error)
+	UpsertCursor(ctx context.Context, q repository.Querier, roomID, userID, seq int64) error
+	UnreadByUser(ctx context.Context, q repository.Querier, userID int64) ([]repository.UnreadCount, error)
+	Insert(ctx context.Context, q repository.Querier, m *model.Message) error
+	GetByClientMsgID(ctx context.Context, q repository.Querier, roomID, senderID int64, clientMsgID string) (*model.Message, error)
+	HasSystemMessage(ctx context.Context, q repository.Querier, roomID int64, kind model.SystemMessageKind) (bool, error)
+}
+
+// MemberStore 抽象 ChatService 所需的成员判据。
+//
+// *repository.MemberRepo 天然满足此接口。
+type MemberStore interface {
+	IsActiveMember(ctx context.Context, q repository.Querier, roomID, userID int64) (bool, error)
+}
+
 // noopPublisher 在 Hub 尚未注入时兜底，避免 nil 调用 panic。
 type noopPublisher struct{}
 
