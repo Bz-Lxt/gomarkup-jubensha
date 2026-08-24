@@ -43,7 +43,11 @@ func InTx(ctx context.Context, pool *sql.DB, fn func(Querier) error) error {
 		return err
 	}
 	if commitErr := tx.Commit(); commitErr != nil {
-		return err
+		// 提交失败必须把 commitErr 传出去。曾经误写成 return err（此时 err 是
+		// fn 返回的 nil），导致 Commit 被数据库拒绝时调用方却拿到 nil，把一个
+		// 已经回滚的事务当成成功，向房间广播了一条从未落库的 chat.message，
+		// 重拉历史时该消息凭空消失。提交不成功就不能确认发送。
+		return fmt.Errorf("commit tx: %w", commitErr)
 	}
 	committed = true
 	return nil
