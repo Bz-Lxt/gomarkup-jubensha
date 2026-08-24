@@ -1,0 +1,73 @@
+# QA 用覆盖文件。用法：
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml run --rm tester
+#
+# 为什么需要它：注册/登录端点按 IP 限流（RATE_LOGIN_PER_MIN 默认 5），
+# 这正是防撞库与防批量灌号该有的行为。但并发抢位测试要一次性建几十个账号，
+# 会被这条规则合法地拦住。因此测试环境显式放宽限流，而**不是**为了让测试
+# 通过就去调低生产默认值。
+services:
+  backend:
+    environment:
+      APP_ENV: test
+      LOG_LEVEL: warn
+      RATE_LOGIN_PER_MIN: "10000"
+      RATE_JOIN_PER_MIN: "10000"
+      RATE_CHAT_PER_MIN: "10000"
+      # 占位有效期缩短，便于验证超时自动回收
+      SLOT_HOLD_TTL: 1m
+      SCHEDULER_INTERVAL: 5s
+      # E2E 里 Playwright 从容器网络内访问前端，浏览器带的 Origin 是
+      # http://frontend-user；WS 握手按白名单校验 Origin，不加进来会被 403。
+      # 生产默认值不含它，仅测试环境放行。
+      CORS_ORIGINS: http://localhost:31811,http://127.0.0.1:31811,http://localhost:5173,http://frontend-user
+
+  tester:
+    build:
+      context: ./tests
+      dockerfile: Dockerfile
+    container_name: jbs-tester
+    environment:
+      TZ: Asia/Shanghai
+      # 容器内走服务名，不经过宿主端口映射
+      API_BASE: http://backend:8080
+      WS_BASE: ws://backend:8080
+      RACERS: "32"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - jbs-net
+    # 挂载而非仅依赖镜像内的副本：tester 在 qa profile 里，`up --build`
+    # 不会重建它，改完用例却跑着镜像里的旧代码是极难察觉的假结果。
+    volumes:
+      - ./tests:/tests:ro
+    # 默认不随 up 启动，只在 run 时执行一次
+    profiles:
+      - qa
+
+  # Playwright 端到端。只测「必须有真实浏览器才能发现」的问题，
+  # 后端契约由上面的 tester 覆盖，两者不重复。
+  e2e:
+    build:
+      context: ./tests/e2e
+      dockerfile: Dockerfile
+    container_name: jbs-e2e
+    environment:
+      TZ: Asia/Shanghai
+      # 被测对象是交付出去的那个前端容器，不是 vite dev server
+      WEB_BASE: http://frontend-user
+      API_BASE: http://backend:8080
+    depends_on:
+      frontend-user:
+        condition: service_healthy
+    networks:
+      - jbs-net
+    # 逐文件覆盖镜像内的副本，而不是把整个目录挂到子路径下：
+    # 挂成 /e2e/src 会让 testDir 同时发现镜像里和挂载里的两份 spec，
+    # 每个用例跑两遍。挂到 node_modules 所在的 /e2e 根上又会盖掉依赖。
+    volumes:
+      - ./tests/e2e/e2e_flow.spec.ts:/e2e/e2e_flow.spec.ts:ro
+      - ./tests/e2e/playwright.config.ts:/e2e/playwright.config.ts:ro
+    profiles:
+      - qa
