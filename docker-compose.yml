@@ -1,0 +1,125 @@
+name: jubensha-carpool
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: jbs-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jbs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jbs_dev_pwd}
+      POSTGRES_DB: ${POSTGRES_DB:-jubensha}
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+    ports:
+      # 仅绑回环，不对外暴露数据库
+      - "127.0.0.1:31812:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jbs} -d ${POSTGRES_DB:-jubensha}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - jbs-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: jbs-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:31813:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - jbs-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jbs-backend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: ${APP_ENV:-development}
+      HTTP_ADDR: ":8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgres://${POSTGRES_USER:-jbs}:${POSTGRES_PASSWORD:-jbs_dev_pwd}@postgres:5432/${POSTGRES_DB:-jubensha}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_DB: "0"
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-please-32bytes-min}
+      JWT_ACCESS_TTL: 2h
+      JWT_REFRESH_TTL: 720h
+      CORS_ORIGINS: http://localhost:31811,http://127.0.0.1:31811,http://localhost:5173
+      SLOT_HOLD_TTL: 15m
+      SLOT_LOCK_TTL: 3s
+      SLOT_AUTO_CONFIRM: "true"
+      # 三层抢位锁的 L2 开关，做成可外部覆盖是刻意的：验收要求「关掉 Redis
+      # 锁后仍然零超载」必须能被真实验证，不然「L3 才是最终保证」只是句口号。
+      #   SLOT_REDIS_LOCK_ENABLED=false docker compose up -d
+      SLOT_REDIS_LOCK_ENABLED: ${SLOT_REDIS_LOCK_ENABLED:-true}
+      BACKFILL_MAX: "200"
+      WS_SEND_BUFFER: "256"
+      WS_PING_INTERVAL: 30s
+      WS_PONG_WAIT: 60s
+      SCHEDULER_INTERVAL: 15s
+      SEED_ON_BOOT: ${SEED_ON_BOOT:-true}
+    ports:
+      - "31810:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - jbs-net
+
+  frontend-user:
+    build:
+      context: ./frontend-user
+      dockerfile: Dockerfile
+      # 刻意不传 VITE_API_BASE / VITE_WS_BASE：留空即同源，前端请求
+      # /api 与 /ws 由本容器的 nginx 反代到 backend。把后端地址烘焙进
+      # bundle 会让镜像绑死在构建时那个主机端口上，换环境即失效。
+    container_name: jbs-frontend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "31811:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - jbs-net
+
+networks:
+  jbs-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:

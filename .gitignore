@@ -1,0 +1,67 @@
+# ---------- Go ----------
+backend/bin/
+backend/tmp/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+vendor/
+
+# ---------- Node / React ----------
+node_modules/
+frontend-user/dist/
+frontend-user/.vite/
+frontend-user/coverage/
+.pnp.*
+.yarn/
+
+# ---------- Playwright ----------
+tests/node_modules/
+tests/e2e/node_modules/
+tests/e2e/package-lock.json
+# 与 playwright.config.ts 里的 outputDir / reporter 输出目录对应
+tests/e2e/artifacts/
+tests/e2e/report/
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
+# ---------- Env & Secrets ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ---------- Logs ----------
+*.log
+logs/
+npm-debug.log*
+yarn-error.log*
+
+# ---------- OS ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- IDE ----------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# ---------- Docker volumes (local) ----------
+.docker-data/
+/docs/
+/.alkaid-sop
+/CLAUDE.md
+/AGENTS.md
+/.cursorrules
+/.github/
