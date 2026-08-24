@@ -1,0 +1,10 @@
+.git
+.gitignore
+bin/
+tmp/
+*.md
+*.test
+coverage.out
+coverage.html
+Dockerfile
+.dockerignore

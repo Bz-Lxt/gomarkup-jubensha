@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-base text-ink font-sans antialiased;
+    /* 顶部 radial 打光：避免大面积纯深色显得死板 */
+    background-image:
+      radial-gradient(1200px 600px at 15% -10%, rgba(139, 92, 246, 0.13), transparent 60%),
+      radial-gradient(900px 500px at 90% 0%, rgba(217, 70, 239, 0.1), transparent 60%);
+    background-attachment: fixed;
+  }
+
+  /* 数字统一等宽字形，避免倒计时逐秒跳动时宽度抖动 */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full;
+    background: rgba(255, 255, 255, 0.1);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.18);
+  }
+
+  /* 移除 outline 会破坏键盘可达性，这里换成品牌色 ring 而不是去掉 */
+  :focus-visible {
+    @apply outline-none ring-2 ring-brand/70 ring-offset-2 ring-offset-base;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border border-hairline bg-surface shadow-card;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border border-hairline bg-raised px-2.5 py-1 text-xs text-ink-muted;
+  }
+
+  .field {
+    @apply w-full rounded-xl border border-hairline bg-raised px-3.5 py-2.5 text-sm text-ink
+      placeholder:text-ink-faint transition
+      focus:border-brand/60 focus:outline-none focus:ring-2 focus:ring-brand/30;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-medium text-ink-muted;
+  }
+
+  /* 骨架屏微光。加载态用它而不是转圈，避免布局跳动 */
+  .skeleton {
+    @apply relative overflow-hidden rounded-lg bg-raised;
+  }
+  .skeleton::after {
+    content: '';
+    @apply absolute inset-0;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.06), transparent);
+    animation: shimmer 1.4s infinite;
+  }
+}
+
+/* 尊重用户的「减少动效」偏好：眩晕敏感人群会被脉冲动画影响 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
